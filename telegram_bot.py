@@ -12,9 +12,10 @@ import os
 import sys
 import io
 import logging
-import tempfile
+import threading
 from datetime import datetime
 from dotenv import load_dotenv
+from flask import Flask
 
 # Load env from same directory (local) or os.environ (Render)
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -357,15 +358,39 @@ async def receive_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 # ============================================================
+# Flask Health Server (for Render free tier port binding)
+# ============================================================
+health_app = Flask(__name__)
+
+@health_app.route("/health")
+def health():
+    return "OK", 200
+
+@health_app.route("/")
+def index():
+    return "🪐 Carmen Prompt Generator Bot is running.", 200
+
+
+def _start_health_server():
+    """Start minimal Flask server so Render detects an open port."""
+    port = int(os.getenv("PORT", "10000"))
+    logger.info(f"💓 Health server on port {port}")
+    health_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+# ============================================================
 # Main
 # ============================================================
 def main():
     token = os.getenv("PROMPT_BOT_TOKEN")
     if not token:
         print("❌ PROMPT_BOT_TOKEN not found in .env")
-        print("Vui lòng thêm PROMPT_BOT_TOKEN vào video-pipeline/.env")
+        print("Vui lòng thêm PROMPT_BOT_TOKEN vào .env")
         print("Tạo bot mới tại @BotFather trên Telegram")
         sys.exit(1)
+
+    # Start health server in background thread (Render needs an open port)
+    threading.Thread(target=_start_health_server, daemon=True).start()
 
     # Build conversation handler
     conv_handler = ConversationHandler(
@@ -403,7 +428,7 @@ def main():
     print("🪐 Carmen Prompt Generator Bot is running...")
     print("   Gửi /start trong Telegram để bắt đầu.")
 
-    # Polling mode
+    # Polling mode (main thread)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
