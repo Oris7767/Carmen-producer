@@ -11,6 +11,7 @@ Requires: TELEGRAM_BOT_TOKEN in .env (separate bot from trading bot)
 import os
 import sys
 import io
+import json
 import logging
 import threading
 from datetime import datetime
@@ -49,6 +50,64 @@ WAITING_SCENES = 2
 WAITING_STYLE = 3
 WAITING_MODEL = 4
 WAITING_CUSTOM_STYLE = 5
+
+# ============================================================
+# Authorization (Whitelist)
+# ============================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTHORIZED_FILE = os.path.join(BASE_DIR, "authorized.json")
+
+def _load_json(path, default):
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+def _save_json(path, data):
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def get_owner_ids() -> list[int]:
+    """Get admin chat IDs from env var ALLOWED_USER_IDS (comma-separated)."""
+    raw = os.environ.get("ALLOWED_USER_IDS", "")
+    ids = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            ids.append(int(part))
+    return ids
+
+def load_authorized() -> set:
+    """Load full authorized user set (owners + runtime-added)."""
+    owners = set(get_owner_ids())
+    runtime = set(_load_json(AUTHORIZED_FILE, {}).get("users", []))
+    return owners | runtime
+
+def save_authorized(users: set):
+    owners = set(get_owner_ids())
+    runtime_only = list(users - owners)
+    _save_json(AUTHORIZED_FILE, {"users": runtime_only})
+
+def is_authorized(chat_id: int) -> bool:
+    return chat_id in load_authorized()
+
+def authorize_user(chat_id: int) -> bool:
+    authorized = load_authorized()
+    if chat_id in authorized:
+        return False
+    authorized.add(chat_id)
+    save_authorized(authorized)
+    return True
+
+def deauthorize_user(chat_id: int) -> bool:
+    authorized = load_authorized()
+    owners = set(get_owner_ids())
+    if chat_id not in authorized or chat_id in owners:
+        return False
+    authorized.discard(chat_id)
+    save_authorized(authorized)
+    return True
 
 # ============================================================
 # User session data (in-memory, resets on restart)
@@ -97,10 +156,24 @@ def get_user_session(user_id: int) -> dict:
 # ============================================================
 # Command Handlers
 # ============================================================
+UNAUTHORIZED_MSG = (
+    "🔒 Bot này là hệ thống cá nhân, chỉ dành cho người được ủy quyền.\n\n"
+    "Nếu bạn nghĩ mình cần quyền truy cập, hãy liên hệ quản trị viên.\n"
+    "Xin cảm ơn! 🙏"
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /start — begin the prompt generation flow."""
     user = update.effective_user
     user_id = user.id
+    chat_id = update.effective_chat.id
+
+    # Authorization check
+    if not is_authorized(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
+
     user_sessions[user_id] = {}  # Reset session
 
     welcome = f"""🪐 *Carmen Prompt Generator* 
@@ -126,6 +199,12 @@ Bot này giúp cậu tạo *hàng loạt prompt* cho ảnh + video + lời tho�
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle /cancel — abort flow."""
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if not is_authorized(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
+
     user_sessions.pop(user_id, None)
     await update.message.reply_text(
         "❌ Đã huỷ. Gửi /start để bắt đầu lại.",
@@ -146,12 +225,96 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="Markdown",
     )
 
+
+# ── Admin Commands ──
+
+async def adduser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /adduser — add a user to whitelist (owner only)."""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in get_owner_ids():
+        await update.message.reply_text("🔒 Bạn không có quyền thực hiện lệnh này.")
+        return
+
+    parts = update.message.text.split()
+    if len(parts) < 2:
+        await update.message.reply_text("⚠️ Cú pháp: /adduser <chat_id>\n\nVí dụ: /adduser 123456789")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("❌ Chat ID không hợp lệ.")
+        return
+
+    if authorize_user(target_id):
+        await update.message.reply_text(f"✅ Đã thêm user `{target_id}` vào danh sách được ủy quyền.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"ℹ️ User `{target_id}` đã có trong danh sách.", parse_mode="Markdown")
+
+
+async def removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /removeuser — remove a user from whitelist (owner only)."""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in get_owner_ids():
+        await update.message.reply_text("🔒 Bạn không có quyền thực hiện lệnh này.")
+        return
+
+    parts = update.message.text.split()
+    if len(parts) < 2:
+        await update.message.reply_text("⚠️ Cú pháp: /removeuser <chat_id>")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("❌ Chat ID không hợp lệ.")
+        return
+
+    if deauthorize_user(target_id):
+        await update.message.reply_text(f"✅ Đã xóa user `{target_id}` khỏi danh sách.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ Không thể xóa. User `{target_id}` không tồn tại hoặc là chủ sở hữu.", parse_mode="Markdown")
+
+
+async def whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /whitelist — show authorized users."""
+    chat_id = update.effective_chat.id
+
+    if not is_authorized(chat_id):
+        return
+
+    authorized = load_authorized()
+    owners = set(get_owner_ids())
+    runtime = authorized - owners
+
+    lines = ["👥 *Danh sách ủy quyền:*\n"]
+    lines.append(f"👑 Chủ sở hữu ({len(owners)}):")
+    for oid in owners:
+        lines.append(f"  • `{oid}`")
+    if runtime:
+        lines.append(f"\n📋 User được thêm ({len(runtime)}):")
+        for rid in sorted(runtime):
+            lines.append(f"  • `{rid}`")
+    else:
+        lines.append("\n(không có user nào được thêm thủ công)")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 # ============================================================
 # State 1: Receive Content
 # ============================================================
 async def receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receive user content and ask for number of scenes."""
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # Re-check authorization at each state
+    if not is_authorized(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
+
     session = get_user_session(user_id)
     session["content"] = update.message.text
 
@@ -172,6 +335,12 @@ async def receive_scenes_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    chat_id = query.message.chat.id
+
+    if not is_authorized(chat_id):
+        await query.edit_message_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
+
     session = get_user_session(user_id)
 
     data = query.data
@@ -195,6 +364,12 @@ async def receive_scenes_callback(update: Update, context: ContextTypes.DEFAULT_
 async def receive_scenes_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle custom scene count via text."""
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if not is_authorized(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
+
     session = get_user_session(user_id)
 
     try:
@@ -226,6 +401,12 @@ async def receive_style_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    chat_id = query.message.chat.id
+
+    if not is_authorized(chat_id):
+        await query.edit_message_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
+
     session = get_user_session(user_id)
 
     data = query.data
@@ -255,6 +436,12 @@ async def receive_style_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def receive_custom_style(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle custom style text input."""
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if not is_authorized(chat_id):
+        await update.message.reply_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
+
     session = get_user_session(user_id)
     session["custom_style"] = update.message.text
 
@@ -275,6 +462,12 @@ async def receive_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    chat_id = query.message.chat.id
+
+    if not is_authorized(chat_id):
+        await query.edit_message_text(UNAUTHORIZED_MSG)
+        return ConversationHandler.END
+
     session = get_user_session(user_id)
 
     model_key = query.data.replace("model_", "")
@@ -423,6 +616,10 @@ def main():
     app = Application.builder().token(token).build()
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("help", help_cmd))
+    # Admin commands
+    app.add_handler(CommandHandler("adduser", adduser))
+    app.add_handler(CommandHandler("removeuser", removeuser))
+    app.add_handler(CommandHandler("whitelist", whitelist))
 
     logger.info("🚀 Prompt Generator Bot starting...")
     print("🪐 Carmen Prompt Generator Bot is running...")
